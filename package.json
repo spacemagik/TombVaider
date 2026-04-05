@@ -1,0 +1,19 @@
+{
+  "name": "tomb-vaider",
+  "version": "1.0.0",
+  "description": "Third-person web game with Three.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@sparkjsdev/spark": "^0.1.10",
+    "lil-gui": "^0.20.0",
+    "three": "^0.178.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tomb Vaider - Third Person Adventure</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { overflow: hidden; background: #0a0a0f; font-family: system-ui, sans-serif; }
+    canvas { display: block; cursor: pointer; }
+    #hud {
+      position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,0.6); color: #ccc; padding: 12px 20px;
+      border-radius: 8px; font-size: 13px; pointer-events: none;
+    }
+    #hud kbd { background: #333; padding: 2px 6px; border-radius: 4px; margin: 0 2px; }
+  </style>
+</head>
+<body>
+  <div id="hud"><kbd>WASD</kbd> Move · <kbd>Shift</kbd> Run · <kbd>Space</kbd> Jump · <kbd>Click</kbd> Lock mouse</div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

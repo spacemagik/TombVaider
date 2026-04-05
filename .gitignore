@@ -1,0 +1,8 @@
+node_modules
+dist
+.DS_Store
+.vite
+*.local
+
+# Gaussian splat source — too large for GitHub (100MB limit). Keep this file locally in project root.
+ruins (1).spz
