@@ -15,13 +15,21 @@ let clock = new THREE.Clock();
 const velocity = new THREE.Vector3();
 const direction = new THREE.Vector3();
 const smoothMove = new THREE.Vector3();
-const moveSpeed = 10;
-const runMultiplier = 2;
 const moveSmoothing = 14;
-const jumpVelocity = 11;
-const gravity = -32;
 const wallProbeHeight = 1.15;
 const wallSkin = 0.42;
+
+const physicsParams = {
+  moveSpeed: 10,
+  runMultiplier: 2,
+  jumpVelocity: 11,
+  gravity: -32,
+  feetYOffset: 0,
+  groundProbeAbove: 40,
+  groundRayFarExtra: 280,
+  snapEpsilon: 0.12,
+  usePlaneFallback: true,
+};
 let isGrounded = true;
 let cameraYaw = 0;
 const mouseSensitivity = 0.003;
@@ -41,8 +49,7 @@ const scaleParams = {
   scaleZ: 1,
   uniformScale: 1,
 };
-let scaleGUI = null;
-let devGuiVisible = false;
+let gameGUI = null;
 let baseScale = 1;
 let debugCube = null;
 
@@ -118,7 +125,7 @@ function init() {
   window.addEventListener('resize', onResize);
   window.addEventListener('keydown', (e) => {
     keys[e.code] = true;
-    if (e.code === 'KeyG' && !e.repeat) toggleDevGUI();
+    if (e.code === 'KeyG' && !e.repeat) toggleGameGUI();
     if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
   });
   window.addEventListener('keyup', (e) => { keys[e.code] = false; });
@@ -141,39 +148,78 @@ function init() {
     }
   });
 
+  setupGameGUI();
+
   animate();
 }
 
-function setupScaleGUI() {
-  if (scaleGUI) scaleGUI.destroy();
-  scaleGUI = new GUI({ title: 'Model scale (G to hide)' });
-  const debugState = { showHelper: false };
-  scaleGUI.add(debugState, 'showHelper').name('Show debug cube').onChange((v) => {
+function setColliderWireframe(show) {
+  colliderMeshes.forEach((m) => {
+    if (show) {
+      if (!m.userData._colliderMat) m.userData._colliderMat = m.material;
+      m.material = new THREE.MeshBasicMaterial({
+        color: 0x22ff66,
+        wireframe: true,
+        transparent: true,
+        opacity: 0.45,
+        depthTest: true,
+        side: THREE.DoubleSide,
+      });
+    } else {
+      const cur = m.material;
+      if (cur && cur.wireframe) cur.dispose();
+      m.material = m.userData._colliderMat || makeColliderMaterial();
+      delete m.userData._colliderMat;
+    }
+  });
+}
+
+function setupGameGUI() {
+  if (gameGUI) gameGUI.destroy();
+  gameGUI = new GUI({ title: 'Tomb Vaider' });
+  const guiState = { showCollider: false, showDebugCube: false };
+
+  const move = gameGUI.addFolder('Movement');
+  move.add(physicsParams, 'moveSpeed', 2, 28, 0.5);
+  move.add(physicsParams, 'runMultiplier', 1, 3.5, 0.05);
+  move.add(physicsParams, 'jumpVelocity', 4, 22, 0.5);
+  move.add(physicsParams, 'gravity', -50, -5, 1);
+  move.open();
+
+  const ground = gameGUI.addFolder('Ground & collision');
+  ground.add(physicsParams, 'feetYOffset', -1, 1.5, 0.01).name('Feet offset (Y)');
+  ground.add(physicsParams, 'groundProbeAbove', 8, 120, 1).name('Ray start above feet');
+  ground.add(physicsParams, 'groundRayFarExtra', 80, 600, 10).name('Ray length extra');
+  ground.add(physicsParams, 'snapEpsilon', 0.02, 0.4, 0.01).name('Snap distance');
+  ground.add(physicsParams, 'usePlaneFallback').name('Flat floor if no mesh hit');
+  ground.add(guiState, 'showCollider').name('Show collider wireframe').onChange(setColliderWireframe);
+  ground.add({ snap: () => snapCharacterToGround() }, 'snap').name('Snap feet to ground now');
+  ground.open();
+
+  const char = gameGUI.addFolder('Character scale');
+  char.add(guiState, 'showDebugCube').name('Orange debug cube').onChange((v) => {
     if (debugCube) debugCube.visible = v;
   });
-  scaleGUI.add(scaleParams, 'uniformScale', 0.001, 100, 0.01).name('Scale (all axes)').onChange(applyScale);
-  scaleGUI.add(scaleParams, 'scaleX', 0.01, 10, 0.01).name('Scale X').onChange(applyScale);
-  scaleGUI.add(scaleParams, 'scaleY', 0.01, 10, 0.01).name('Scale Y').onChange(applyScale);
-  scaleGUI.add(scaleParams, 'scaleZ', 0.01, 10, 0.01).name('Scale Z').onChange(applyScale);
-  scaleGUI.add({ reset: () => {
+  char.add(scaleParams, 'uniformScale', 0.001, 100, 0.01).name('Uniform').onChange(applyScale);
+  char.add(scaleParams, 'scaleX', 0.01, 10, 0.01).name('Scale X').onChange(applyScale);
+  char.add(scaleParams, 'scaleY', 0.01, 10, 0.01).name('Scale Y').onChange(applyScale);
+  char.add(scaleParams, 'scaleZ', 0.01, 10, 0.01).name('Scale Z').onChange(applyScale);
+  char.add({ reset: () => {
     scaleParams.uniformScale = 1;
     scaleParams.scaleX = 1;
     scaleParams.scaleY = 1;
     scaleParams.scaleZ = 1;
-    if (scaleGUI) scaleGUI.controllers.forEach((c) => c.updateDisplay?.());
+    char.controllers.forEach((c) => c.updateDisplay?.());
     applyScale();
-  } }, 'reset').name('Reset to 1');
+  } }, 'reset').name('Reset scale');
 }
 
-function toggleDevGUI() {
-  if (!scaleGUI) {
-    setupScaleGUI();
-    devGuiVisible = true;
-    scaleGUI.domElement.style.display = '';
+function toggleGameGUI() {
+  if (!gameGUI) {
+    setupGameGUI();
     return;
   }
-  devGuiVisible = !devGuiVisible;
-  scaleGUI.domElement.style.display = devGuiVisible ? '' : 'none';
+  gameGUI.domElement.style.display = gameGUI.domElement.style.display === 'none' ? '' : 'none';
 }
 
 function applyScale() {
@@ -186,7 +232,7 @@ function applyScale() {
   );
 }
 
-/** Invisible mesh: raycasts only, does not draw or write depth (keeps splats visible). */
+/** Invisible mesh: raycasts from both sides (many bake / simplified meshes are flipped). */
 function makeColliderMaterial() {
   return new THREE.MeshBasicMaterial({
     transparent: true,
@@ -194,6 +240,7 @@ function makeColliderMaterial() {
     depthWrite: false,
     colorWrite: false,
     visible: false,
+    side: THREE.DoubleSide,
   });
 }
 
@@ -213,7 +260,7 @@ function snapCharacterToGround() {
   const gy = resolveGroundHeight(x, z, 400);
   characterRoot.position.x = x;
   characterRoot.position.z = z;
-  characterRoot.position.y = gy !== null ? gy : 0;
+  characterRoot.position.y = (gy !== null ? gy : 0) + physicsParams.feetYOffset;
   velocity.y = 0;
   isGrounded = gy !== null;
 }
@@ -229,6 +276,12 @@ function loadWorldAndCharacter() {
       const colliderRoot = gltf.scene;
       colliderRoot.traverse((child) => {
         if (child.isMesh) {
+          const g = child.geometry;
+          if (g) {
+            g.computeBoundingBox();
+            g.computeBoundingSphere();
+          }
+          child.frustumCulled = false;
           child.material = makeColliderMaterial();
           child.castShadow = false;
           child.receiveShadow = false;
@@ -366,10 +419,12 @@ function getMoveInput() {
 }
 
 function resolveGroundHeight(x, z, startY) {
+  worldRoot.updateMatrixWorld(true);
   if (!collidersReady || colliderMeshes.length === 0) return null;
+  groundRaycaster.near = 0;
   rayOrigin.set(x, startY, z);
   groundRaycaster.set(rayOrigin, rayDirDown);
-  groundRaycaster.far = startY + 200;
+  groundRaycaster.far = startY + physicsParams.groundRayFarExtra;
   const hits = groundRaycaster.intersectObjects(colliderMeshes, false);
   if (hits.length === 0) return null;
   return hits[0].point.y;
@@ -393,7 +448,9 @@ function updateCharacter(delta) {
   if (direction.lengthSq() > 0) direction.normalize();
 
   const running = keys['ShiftLeft'] || keys['ShiftRight'];
-  const speed = running ? moveSpeed * runMultiplier : moveSpeed;
+  const speed = running
+    ? physicsParams.moveSpeed * physicsParams.runMultiplier
+    : physicsParams.moveSpeed;
   const targetX = direction.x * speed;
   const targetZ = direction.z * speed;
   const t = 1 - Math.exp(-moveSmoothing * delta);
@@ -408,11 +465,11 @@ function updateCharacter(delta) {
   velocity.z = smoothMove.z;
 
   if (keys['Space'] && isGrounded) {
-    velocity.y = jumpVelocity;
+    velocity.y = physicsParams.jumpVelocity;
     isGrounded = false;
     playAction('jump', 0.1);
   }
-  velocity.y += gravity * delta;
+  velocity.y += physicsParams.gravity * delta;
 
   let stepX = velocity.x * delta;
   let stepZ = velocity.z * delta;
@@ -443,17 +500,21 @@ function updateCharacter(delta) {
   characterRoot.position.z += stepZ;
   characterRoot.position.y += velocity.y * delta;
 
-  const probeTop = characterRoot.position.y + 25;
-  const groundY = resolveGroundHeight(
+  const probeTop = characterRoot.position.y + physicsParams.groundProbeAbove;
+  let groundY = resolveGroundHeight(
     characterRoot.position.x,
     characterRoot.position.z,
     probeTop
   );
+  if (groundY === null && physicsParams.usePlaneFallback) {
+    groundY = 0;
+  }
 
   if (groundY !== null) {
-    const eps = 0.08;
-    if (velocity.y <= 0 && characterRoot.position.y <= groundY + eps) {
-      characterRoot.position.y = groundY;
+    const surfaceY = groundY + physicsParams.feetYOffset;
+    const eps = physicsParams.snapEpsilon;
+    if (velocity.y <= 0 && characterRoot.position.y <= surfaceY + eps) {
+      characterRoot.position.y = surfaceY;
       velocity.y = 0;
       isGrounded = true;
     }
