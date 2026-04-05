@@ -14,10 +14,14 @@ let mixer, actions = {}, currentAction;
 let clock = new THREE.Clock();
 const velocity = new THREE.Vector3();
 const direction = new THREE.Vector3();
-const moveSpeed = 8;
-const runMultiplier = 1.8;
-const jumpVelocity = 12;
-const gravity = -30;
+const smoothMove = new THREE.Vector3();
+const moveSpeed = 10;
+const runMultiplier = 2;
+const moveSmoothing = 14;
+const jumpVelocity = 11;
+const gravity = -32;
+const wallProbeHeight = 1.15;
+const wallSkin = 0.42;
 let isGrounded = true;
 let cameraYaw = 0;
 const mouseSensitivity = 0.003;
@@ -38,8 +42,17 @@ const scaleParams = {
   uniformScale: 1,
 };
 let scaleGUI = null;
+let devGuiVisible = false;
 let baseScale = 1;
 let debugCube = null;
+
+const loadingEl = typeof document !== 'undefined' ? document.getElementById('loading') : null;
+function setLoadingVisible(visible, text) {
+  if (!loadingEl) return;
+  if (text) loadingEl.textContent = text;
+  loadingEl.classList.toggle('hidden', !visible);
+  loadingEl.style.pointerEvents = visible ? 'auto' : 'none';
+}
 
 const ASSETS = {
   collider: '/simplified-mesh.glb',
@@ -51,7 +64,7 @@ const ASSETS = {
 function init() {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x1a1a28);
-  scene.fog = new THREE.Fog(0x1a1a28, 80, 280);
+  scene.fog = new THREE.Fog(0x1a1a28, 100, 420);
 
   camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 2000);
   camera.position.set(0, 4, 10);
@@ -99,10 +112,15 @@ function init() {
   debugCube.visible = false;
   characterRoot.add(debugCube);
 
+  setLoadingVisible(true, 'Loading scene…');
   loadWorldAndCharacter();
 
   window.addEventListener('resize', onResize);
-  window.addEventListener('keydown', (e) => { keys[e.code] = true; e.preventDefault(); });
+  window.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (e.code === 'KeyG' && !e.repeat) toggleDevGUI();
+    if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+  });
   window.addEventListener('keyup', (e) => { keys[e.code] = false; });
   document.addEventListener('pointermove', (e) => {
     pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
@@ -128,7 +146,7 @@ function init() {
 
 function setupScaleGUI() {
   if (scaleGUI) scaleGUI.destroy();
-  scaleGUI = new GUI({ title: 'Model Scale' });
+  scaleGUI = new GUI({ title: 'Model scale (G to hide)' });
   const debugState = { showHelper: false };
   scaleGUI.add(debugState, 'showHelper').name('Show debug cube').onChange((v) => {
     if (debugCube) debugCube.visible = v;
@@ -145,6 +163,17 @@ function setupScaleGUI() {
     if (scaleGUI) scaleGUI.controllers.forEach((c) => c.updateDisplay?.());
     applyScale();
   } }, 'reset').name('Reset to 1');
+}
+
+function toggleDevGUI() {
+  if (!scaleGUI) {
+    setupScaleGUI();
+    devGuiVisible = true;
+    scaleGUI.domElement.style.display = '';
+    return;
+  }
+  devGuiVisible = !devGuiVisible;
+  scaleGUI.domElement.style.display = devGuiVisible ? '' : 'none';
 }
 
 function applyScale() {
@@ -176,6 +205,19 @@ function alignWorldToCollider(colliderRoot) {
   worldRoot.updateMatrixWorld(true);
 }
 
+function snapCharacterToGround() {
+  if (!collidersReady) return;
+  const x = characterRoot.position.x;
+  const z = characterRoot.position.z;
+  characterRoot.position.y = 200;
+  const gy = resolveGroundHeight(x, z, 400);
+  characterRoot.position.x = x;
+  characterRoot.position.z = z;
+  characterRoot.position.y = gy !== null ? gy : 0;
+  velocity.y = 0;
+  isGrounded = gy !== null;
+}
+
 function loadWorldAndCharacter() {
   const gltfLoader = new GLTFLoader();
   colliderMeshes = [];
@@ -202,9 +244,11 @@ function loadWorldAndCharacter() {
       ruins.quaternion.set(1, 0, 0, 0);
       worldRoot.add(ruins);
       ruins.initialized.then(() => {
-        console.log('Ruins splat loaded');
+        setLoadingVisible(false);
       }).catch((err) => {
         console.error('Ruins splat failed:', err);
+        setLoadingVisible(true, 'Could not load ruins.spz — add ruins (1).spz in project root');
+        setTimeout(() => setLoadingVisible(false), 5000);
       });
 
       loadCharacterModel(gltfLoader);
@@ -213,6 +257,7 @@ function loadWorldAndCharacter() {
     (err) => {
       console.error('Collider GLB failed:', err);
       loadCharacterModel(gltfLoader);
+      setLoadingVisible(false);
     }
   );
 }
@@ -244,8 +289,8 @@ function loadCharacterModel(gltfLoader) {
       scaleParams.scaleZ = 1;
       characterRoot.add(character);
 
-      setupScaleGUI();
       applyScale();
+      snapCharacterToGround();
 
       if (gltf.animations && gltf.animations.length > 0) {
         mixer = new THREE.AnimationMixer(character);
@@ -285,8 +330,8 @@ function loadFBXCharacter() {
     scaleParams.scaleX = 1;
     scaleParams.scaleY = 1;
     scaleParams.scaleZ = 1;
-    setupScaleGUI();
     applyScale();
+    snapCharacterToGround();
 
     if (fbx.animations && fbx.animations.length > 0) {
       mixer = new THREE.AnimationMixer(character);
@@ -347,9 +392,20 @@ function updateCharacter(delta) {
   if (strafe) direction.addScaledVector(right, strafe);
   if (direction.lengthSq() > 0) direction.normalize();
 
-  const speed = keys['ShiftLeft'] ? moveSpeed * runMultiplier : moveSpeed;
-  velocity.x = direction.x * speed;
-  velocity.z = direction.z * speed;
+  const running = keys['ShiftLeft'] || keys['ShiftRight'];
+  const speed = running ? moveSpeed * runMultiplier : moveSpeed;
+  const targetX = direction.x * speed;
+  const targetZ = direction.z * speed;
+  const t = 1 - Math.exp(-moveSmoothing * delta);
+  if (moving) {
+    smoothMove.x += (targetX - smoothMove.x) * t;
+    smoothMove.z += (targetZ - smoothMove.z) * t;
+  } else {
+    smoothMove.x *= Math.exp(-10 * delta);
+    smoothMove.z *= Math.exp(-10 * delta);
+  }
+  velocity.x = smoothMove.x;
+  velocity.z = smoothMove.z;
 
   if (keys['Space'] && isGrounded) {
     velocity.y = jumpVelocity;
@@ -358,8 +414,33 @@ function updateCharacter(delta) {
   }
   velocity.y += gravity * delta;
 
-  characterRoot.position.x += velocity.x * delta;
-  characterRoot.position.z += velocity.z * delta;
+  let stepX = velocity.x * delta;
+  let stepZ = velocity.z * delta;
+  const stepLen = Math.hypot(stepX, stepZ);
+  if (collidersReady && stepLen > 1e-4) {
+    const dir = tmpVec.set(stepX / stepLen, 0, stepZ / stepLen);
+    rayOrigin.set(
+      characterRoot.position.x,
+      characterRoot.position.y + wallProbeHeight,
+      characterRoot.position.z
+    );
+    groundRaycaster.set(rayOrigin, dir);
+    groundRaycaster.far = stepLen + wallSkin;
+    const wallHits = groundRaycaster.intersectObjects(colliderMeshes, false);
+    if (wallHits.length > 0) {
+      const allow = Math.max(0, wallHits[0].distance - wallSkin);
+      const scale = Math.min(1, allow / stepLen);
+      stepX *= scale;
+      stepZ *= scale;
+      smoothMove.x *= scale;
+      smoothMove.z *= scale;
+      velocity.x = smoothMove.x;
+      velocity.z = smoothMove.z;
+    }
+  }
+
+  characterRoot.position.x += stepX;
+  characterRoot.position.z += stepZ;
   characterRoot.position.y += velocity.y * delta;
 
   const probeTop = characterRoot.position.y + 25;
@@ -397,7 +478,7 @@ function updateCharacter(delta) {
   }
 
   if (mixer && Object.keys(actions).length > 0 && isGrounded) {
-    const wantAction = moving ? (keys['ShiftLeft'] ? 'run' : 'walk') : 'idle';
+    const wantAction = moving ? (running ? 'run' : 'walk') : 'idle';
     const curName = (currentAction?.getClip()?.name || '').toLowerCase();
     const hasWalk = curName.includes('walk');
     const hasRun = curName.includes('run');
