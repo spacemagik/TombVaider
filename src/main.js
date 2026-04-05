@@ -42,6 +42,22 @@ const tmpVec = new THREE.Vector3();
 /** @type {THREE.Mesh[]} */
 let colliderMeshes = [];
 let collidersReady = false;
+/** @type {SplatMesh | null} */
+let ruinsSplat = null;
+/** @type {THREE.Object3D | null} */
+let levelColliderRoot = null;
+
+/** Extra splat transform after auto-align (also used in origin preview). */
+const splatFineTune = {
+  offsetX: 0,
+  offsetY: 0,
+  offsetZ: 0,
+  rotYDeg: 0,
+  uniformScale: 1,
+};
+let lineupPreviewActive = false;
+/** @type {{ wireframeBefore: boolean } | null} */
+let lineupSnapshot = null;
 
 const scaleParams = {
   scaleX: 1,
@@ -212,6 +228,43 @@ function setupGameGUI() {
     char.controllers.forEach((c) => c.updateDisplay?.());
     applyScale();
   } }, 'reset').name('Reset scale');
+
+  const world = gameGUI.addFolder('Splat ↔ collider');
+  world.add({
+    realign: () => {
+      if (ruinsSplat && levelColliderRoot) {
+        alignRuinsToCollider(ruinsSplat, levelColliderRoot);
+        snapCharacterToGround();
+      }
+    },
+  }, 'realign').name('Re-align splat to mesh');
+
+  const lineup = gameGUI.addFolder('Line-up at origin (debug)');
+  lineup.add({ preview: false }, 'preview').name('Preview: mesh+spz at 0,0,0').onChange((v) => setLineupPreview(v));
+  lineup.add(splatFineTune, 'offsetX', -400, 400, 0.5).name('Splat offset X').onChange(onSplatFineTuneChanged);
+  lineup.add(splatFineTune, 'offsetY', -400, 400, 0.5).name('Splat offset Y').onChange(onSplatFineTuneChanged);
+  lineup.add(splatFineTune, 'offsetZ', -400, 400, 0.5).name('Splat offset Z').onChange(onSplatFineTuneChanged);
+  lineup.add(splatFineTune, 'rotYDeg', -180, 180, 1).name('Splat rotate Y (°)').onChange(onSplatFineTuneChanged);
+  lineup.add(splatFineTune, 'uniformScale', 0.05, 8, 0.01).name('Splat scale').onChange(onSplatFineTuneChanged);
+  lineup.add({
+    log: () => {
+      console.log(
+        '[TombVaider] splatFineTune — paste into code if you want defaults:',
+        JSON.stringify(splatFineTune, null, 2)
+      );
+    },
+  }, 'log').name('Log values (console)');
+  lineup.add({
+    zero: () => {
+      splatFineTune.offsetX = 0;
+      splatFineTune.offsetY = 0;
+      splatFineTune.offsetZ = 0;
+      splatFineTune.rotYDeg = 0;
+      splatFineTune.uniformScale = 1;
+      lineup.controllers.forEach((c) => c.updateDisplay?.());
+      onSplatFineTuneChanged();
+    },
+  }, 'zero').name('Reset splat sliders');
 }
 
 function toggleGameGUI() {
@@ -252,6 +305,98 @@ function alignWorldToCollider(colliderRoot) {
   worldRoot.updateMatrixWorld(true);
 }
 
+/**
+ * SPZ and simplified GLB often export with different origins. Match splat AABB to collider in world space
+ * so the character at scene origin sits inside both.
+ */
+const sparkFlipQuat = new THREE.Quaternion().set(1, 0, 0, 0);
+
+function applySplatFineTuneToObject(ruins, basePosition) {
+  ruins.scale.setScalar(splatFineTune.uniformScale);
+  const qy = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(0, 1, 0),
+    THREE.MathUtils.degToRad(splatFineTune.rotYDeg)
+  );
+  ruins.quaternion.copy(sparkFlipQuat).multiply(qy);
+  ruins.position.copy(basePosition);
+  ruins.position.x += splatFineTune.offsetX;
+  ruins.position.y += splatFineTune.offsetY;
+  ruins.position.z += splatFineTune.offsetZ;
+  ruins.updateMatrixWorld(true);
+}
+
+function alignRuinsToCollider(ruins, colliderRoot) {
+  if (lineupPreviewActive) return;
+  if (!ruins.isInitialized) return;
+
+  ruins.position.set(0, 0, 0);
+  ruins.scale.set(1, 1, 1);
+  ruins.quaternion.set(1, 0, 0, 0);
+  ruins.updateMatrixWorld(true);
+  worldRoot.updateMatrixWorld(true);
+
+  tmpBox.setFromObject(colliderRoot);
+  const collWorld = tmpBox.clone();
+  const cCenter = collWorld.getCenter(new THREE.Vector3());
+  const cMinY = collWorld.min.y;
+
+  const sb = ruins.getBoundingBox(false);
+  const splWorld = sb.clone().applyMatrix4(ruins.matrixWorld);
+  const sCenter = splWorld.getCenter(new THREE.Vector3());
+  const sMinY = splWorld.min.y;
+
+  const delta = new THREE.Vector3(
+    cCenter.x - sCenter.x,
+    cMinY - sMinY,
+    cCenter.z - sCenter.z
+  );
+  applySplatFineTuneToObject(ruins, delta);
+
+  const sz = collWorld.getSize(new THREE.Vector3());
+  const fogFar = Math.max(480, sz.length() * 1.8);
+  const fogNear = Math.min(120, fogFar * 0.12);
+  scene.fog.near = fogNear;
+  scene.fog.far = fogFar;
+
+  console.log('[TombVaider] Aligned ruins.spz to collider. Level size ~', sz.x.toFixed(1), sz.y.toFixed(1), sz.z.toFixed(1));
+}
+
+function applyLineupPreviewTransforms() {
+  if (!ruinsSplat) return;
+  worldRoot.position.set(0, 0, 0);
+  worldRoot.updateMatrixWorld(true);
+  applySplatFineTuneToObject(ruinsSplat, new THREE.Vector3(0, 0, 0));
+}
+
+function setLineupPreview(on) {
+  if (!ruinsSplat || !levelColliderRoot) return;
+  if (on && !lineupPreviewActive) {
+    lineupPreviewActive = true;
+    lineupSnapshot = { wireframeBefore: colliderMeshes.some((m) => m.material?.wireframe) };
+    setColliderWireframe(true);
+    applyLineupPreviewTransforms();
+    return;
+  }
+  if (!on && lineupPreviewActive) {
+    lineupPreviewActive = false;
+    const wf = lineupSnapshot?.wireframeBefore ?? false;
+    lineupSnapshot = null;
+    setColliderWireframe(wf);
+    alignWorldToCollider(levelColliderRoot);
+    alignRuinsToCollider(ruinsSplat, levelColliderRoot);
+    snapCharacterToGround();
+  }
+}
+
+function onSplatFineTuneChanged() {
+  if (!ruinsSplat || !levelColliderRoot || !ruinsSplat.isInitialized) return;
+  if (lineupPreviewActive) applyLineupPreviewTransforms();
+  else {
+    alignRuinsToCollider(ruinsSplat, levelColliderRoot);
+    snapCharacterToGround();
+  }
+}
+
 function snapCharacterToGround() {
   if (!collidersReady) return;
   const x = characterRoot.position.x;
@@ -274,6 +419,7 @@ function loadWorldAndCharacter() {
     ASSETS.collider,
     (gltf) => {
       const colliderRoot = gltf.scene;
+      levelColliderRoot = colliderRoot;
       colliderRoot.traverse((child) => {
         if (child.isMesh) {
           const g = child.geometry;
@@ -294,9 +440,12 @@ function loadWorldAndCharacter() {
       collidersReady = colliderMeshes.length > 0;
 
       const ruins = new SplatMesh({ url: ASSETS.splat });
-      ruins.quaternion.set(1, 0, 0, 0);
+      ruinsSplat = ruins;
+      ruins.quaternion.copy(sparkFlipQuat);
       worldRoot.add(ruins);
       ruins.initialized.then(() => {
+        alignRuinsToCollider(ruins, colliderRoot);
+        snapCharacterToGround();
         setLoadingVisible(false);
       }).catch((err) => {
         console.error('Ruins splat failed:', err);
