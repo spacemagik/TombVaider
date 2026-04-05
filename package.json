@@ -4,6 +4,7 @@
   "description": "Third-person web game with Three.js",
   "type": "module",
   "scripts": {
+    "start": "vite",
     "dev": "vite",
     "build": "vite build",
     "build:pages": "vite build --base=/TombVaider/",
