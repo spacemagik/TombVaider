@@ -59,6 +59,11 @@ let lineupPreviewActive = false;
 /** @type {{ wireframeBefore: boolean } | null} */
 let lineupSnapshot = null;
 
+const viewParams = {
+  /** Off by default: line up collider + splat without Laura8 in the way. */
+  showCharacter: false,
+};
+
 const scaleParams = {
   scaleX: 1,
   scaleY: 1,
@@ -125,6 +130,7 @@ function init() {
 
   characterRoot = new THREE.Group();
   characterRoot.position.set(0, 0, 0);
+  characterRoot.visible = viewParams.showCharacter;
   scene.add(characterRoot);
 
   const debugGeo = new THREE.BoxGeometry(0.4, 0.4, 0.4);
@@ -194,6 +200,13 @@ function setupGameGUI() {
   if (gameGUI) gameGUI.destroy();
   gameGUI = new GUI({ title: 'Tomb Vaider' });
   const guiState = { showCollider: false, showDebugCube: false };
+
+  const view = gameGUI.addFolder('View');
+  view.add(viewParams, 'showCharacter').name('Show character (Laura8)').onChange((v) => {
+    characterRoot.visible = v;
+    if (v && !character) loadCharacterModel(new GLTFLoader());
+  });
+  view.open();
 
   const move = gameGUI.addFolder('Movement');
   move.add(physicsParams, 'moveSpeed', 2, 28, 0.5);
@@ -453,12 +466,12 @@ function loadWorldAndCharacter() {
         setTimeout(() => setLoadingVisible(false), 5000);
       });
 
-      loadCharacterModel(gltfLoader);
+      if (viewParams.showCharacter) loadCharacterModel(gltfLoader);
     },
     undefined,
     (err) => {
       console.error('Collider GLB failed:', err);
-      loadCharacterModel(gltfLoader);
+      if (viewParams.showCharacter) loadCharacterModel(gltfLoader);
       setLoadingVisible(false);
     }
   );
@@ -490,6 +503,7 @@ function loadCharacterModel(gltfLoader) {
       scaleParams.scaleY = 1;
       scaleParams.scaleZ = 1;
       characterRoot.add(character);
+      characterRoot.visible = viewParams.showCharacter;
 
       applyScale();
       snapCharacterToGround();
@@ -527,6 +541,7 @@ function loadFBXCharacter() {
     baseScale = (maxDim > 0.001 && maxDim < 1e6 ? 1.8 / maxDim : 1) * 0.01;
     character.position.y = 0;
     characterRoot.add(character);
+    characterRoot.visible = viewParams.showCharacter;
 
     scaleParams.uniformScale = 1;
     scaleParams.scaleX = 1;
