@@ -42,7 +42,7 @@ That writes **`public/ruins-lod.rad`**. For HTTP streaming with chunk files, add
 - `public/ruins-lod.rad` — Optional; generated locally with `build:rad` (typically not committed if large)
 - `Animations/` — Optional FBX fallback animations
 
-The game loads Laura8 when enabled in the panel; if the GLB has animations they are used, otherwise it may fall back to FBX.
+The game loads **Laura8 by default**; turn **Show character (Laura8)** off in the panel if you only want to align splats and collider. If the GLB has animations they are used, otherwise it may fall back to FBX.
 
 ## Build
 

@@ -69,8 +69,8 @@ let lineupPreviewActive = false;
 let lineupSnapshot = null;
 
 const viewParams = {
-  /** Off by default: line up collider + splat without Laura8 in the way. */
-  showCharacter: false,
+  /** Turn off in the panel when lining up splats without the character in frame. */
+  showCharacter: true,
 };
 
 const layerParams = {
