@@ -6,3 +6,7 @@ dist
 
 # Gaussian splat source — too large for GitHub (100MB limit). Keep this file locally in project root.
 ruins (1).spz
+
+# Spark build-lod output — large; generate with npm run build:rad
+public/ruins-lod.rad
+public/*-lod-*.radc
