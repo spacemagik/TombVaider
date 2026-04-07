@@ -8,12 +8,13 @@
     "dev": "vite",
     "build": "vite build",
     "build:pages": "vite build --base=/TombVaider/",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "build:rad": "cargo run --manifest-path node_modules/@sparkjsdev/spark/rust/build-lod/Cargo.toml --release --"
   },
   "dependencies": {
-    "@sparkjsdev/spark": "^0.1.10",
+    "@sparkjsdev/spark": "https://github.com/sparkjsdev/spark/archive/refs/heads/v2.0.0-preview.tar.gz",
     "lil-gui": "^0.20.0",
-    "three": "^0.178.0"
+    "three": "^0.180.0"
   },
   "devDependencies": {
     "vite": "^5.4.0"

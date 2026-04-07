@@ -1,13 +1,20 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
-import { SplatMesh } from '@sparkjsdev/spark';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { SplatMesh, SparkRenderer } from '@sparkjsdev/spark';
 import GUI from 'lil-gui';
 
 // --- Game State ---
 const keys = {};
 const pointer = { x: 0, y: 0 };
+/** Trackpad / mouse: orbit camera yaw while dragging on canvas (follow mode only). */
+let lookDragActive = false;
+let lookDragLastX = 0;
 let scene, camera, renderer;
+/** @type {SparkRenderer | null} */
+let sparkRenderer = null;
+let orbitControls = null;
 let worldRoot;
 let character, characterRoot;
 let mixer, actions = {}, currentAction;
@@ -24,6 +31,8 @@ const physicsParams = {
   runMultiplier: 2,
   jumpVelocity: 11,
   gravity: -32,
+  /** Hold Q / E — vertical nudge (layout + escape tight spots). */
+  flyVerticalSpeed: 12,
   feetYOffset: 0,
   groundProbeAbove: 40,
   groundRayFarExtra: 280,
@@ -64,6 +73,23 @@ const viewParams = {
   showCharacter: false,
 };
 
+const layerParams = {
+  showColliderMesh: true,
+  showSplat: true,
+};
+
+const cameraParams = {
+  followDistance: 8,
+  followHeight: 2,
+  /** Drag to orbit, wheel zoom — good for lining up mesh + SPZ */
+  freeOrbit: false,
+};
+
+/** Trackpad-friendly: use drag-to-look + L to lock; click-to-lock fights two-finger scroll. */
+const inputParams = {
+  pointerLockOnClick: false,
+};
+
 const scaleParams = {
   scaleX: 1,
   scaleY: 1,
@@ -78,14 +104,39 @@ const loadingEl = typeof document !== 'undefined' ? document.getElementById('loa
 function setLoadingVisible(visible, text) {
   if (!loadingEl) return;
   if (text) loadingEl.textContent = text;
-  loadingEl.classList.toggle('hidden', !visible);
-  loadingEl.style.pointerEvents = visible ? 'auto' : 'none';
+  if (visible) {
+    loadingEl.classList.remove('hidden');
+    loadingEl.style.display = 'flex';
+    loadingEl.style.visibility = '';
+    loadingEl.setAttribute('aria-hidden', 'false');
+  } else {
+    loadingEl.classList.add('hidden');
+    loadingEl.style.display = 'none';
+    loadingEl.style.visibility = 'hidden';
+    loadingEl.setAttribute('aria-hidden', 'true');
+  }
 }
 
 const ASSETS = {
   collider: '/simplified-mesh.glb',
-  splat: '/ruins.spz',
+  /** Output of: npm run build:rad -- public/ruins.spz --quality */
+  splatRad: '/ruins-lod.rad',
+  /** Fallback when .rad is missing: on-the-fly LoD in a worker (slower first load). */
+  splatSpz: '/ruins.spz',
   character: '/Animations/Laura8.glb',
+};
+
+/** Spark 2.0: pre-built .RAD vs runtime lod; paged streaming for chunked .rad + .radc (see Spark LoD docs). */
+const splatLoadParams = {
+  preferRad: true,
+  /** Use with `build:rad -- … --rad-chunked`; requires matching .radc chunk files. */
+  pagedStreaming: false,
+  /** For large coordinates: set on mesh + SparkRenderer.pagedExtSplats when using paged. */
+  extSplats: false,
+};
+
+const sparkLodParams = {
+  lodSplatScale: 1,
 };
 
 // --- Scene Setup ---
@@ -97,13 +148,74 @@ function init() {
   camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 2000);
   camera.position.set(0, 4, 10);
 
-  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer = new THREE.WebGLRenderer({ antialias: false });
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   document.body.appendChild(renderer.domElement);
+
+  sparkRenderer = new SparkRenderer({
+    renderer,
+    clock,
+    lodSplatScale: sparkLodParams.lodSplatScale,
+    pagedExtSplats: splatLoadParams.extSplats && splatLoadParams.pagedStreaming,
+  });
+  scene.add(sparkRenderer);
+
+  orbitControls = new OrbitControls(camera, renderer.domElement);
+  orbitControls.enableDamping = true;
+  orbitControls.dampingFactor = 0.06;
+  orbitControls.minDistance = 0.5;
+  orbitControls.maxDistance = 1500;
+  orbitControls.enabled = false;
+  orbitControls.target.set(0, 1, 0);
+
+  renderer.domElement.addEventListener(
+    'wheel',
+    (e) => {
+      if (cameraParams.freeOrbit) return;
+      e.preventDefault();
+      const dy = THREE.MathUtils.clamp(e.deltaY, -140, 140);
+      const scale = (cameraParams.followDistance * 0.06 + 0.45) * 0.035;
+      const step = dy * scale;
+      cameraParams.followDistance = THREE.MathUtils.clamp(
+        cameraParams.followDistance + step,
+        1,
+        600
+      );
+    },
+    { passive: false }
+  );
+
+  const canvas = renderer.domElement;
+  canvas.tabIndex = 0;
+  canvas.style.touchAction = 'none';
+
+  canvas.addEventListener('pointerdown', (e) => {
+    if (cameraParams.freeOrbit || document.pointerLockElement) return;
+    if (e.button !== 0) return;
+    lookDragActive = true;
+    lookDragLastX = e.clientX;
+    try {
+      canvas.setPointerCapture(e.pointerId);
+    } catch (_) {
+      /* ignore */
+    }
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!lookDragActive || document.pointerLockElement || cameraParams.freeOrbit) return;
+    const dx = e.clientX - lookDragLastX;
+    lookDragLastX = e.clientX;
+    cameraYaw -= dx * mouseSensitivity;
+  });
+  const endLookDrag = () => {
+    lookDragActive = false;
+  };
+  canvas.addEventListener('pointerup', endLookDrag);
+  canvas.addEventListener('pointercancel', endLookDrag);
+  canvas.addEventListener('lostpointercapture', endLookDrag);
 
   const ambient = new THREE.AmbientLight(0xffffff, 0.55);
   scene.add(ambient);
@@ -146,15 +258,24 @@ function init() {
 
   window.addEventListener('resize', onResize);
   window.addEventListener('keydown', (e) => {
+    if (e.target?.closest?.('.lil-gui')) return;
     keys[e.code] = true;
     if (e.code === 'KeyG' && !e.repeat) toggleGameGUI();
+    if (e.code === 'KeyL' && !e.repeat && !cameraParams.freeOrbit) {
+      if (document.pointerLockElement) document.exitPointerLock();
+      else canvas.requestPointerLock();
+    }
     if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
   });
-  window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+  window.addEventListener('keyup', (e) => {
+    keys[e.code] = false;
+  });
   document.addEventListener('pointermove', (e) => {
     pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
     pointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
-    if (document.pointerLockElement) cameraYaw -= e.movementX * mouseSensitivity;
+    if (document.pointerLockElement && !cameraParams.freeOrbit) {
+      cameraYaw -= e.movementX * mouseSensitivity;
+    }
   });
   document.addEventListener('pointerlockchange', () => {
     if (!document.pointerLockElement) {
@@ -163,9 +284,10 @@ function init() {
     }
   });
 
-  renderer.domElement.addEventListener('click', () => {
+  canvas.addEventListener('click', () => {
+    if (cameraParams.freeOrbit || !inputParams.pointerLockOnClick) return;
     if (!document.pointerLockElement) {
-      renderer.domElement.requestPointerLock();
+      canvas.requestPointerLock();
       keys['PointerLock'] = true;
     }
   });
@@ -206,12 +328,75 @@ function setupGameGUI() {
     characterRoot.visible = v;
     if (v && !character) loadCharacterModel(new GLTFLoader());
   });
+  view
+    .add(inputParams, 'pointerLockOnClick')
+    .name('Click canvas locks pointer (mouse)');
   view.open();
+
+  const sceneVis = gameGUI.addFolder('Scene layers');
+  sceneVis
+    .add(layerParams, 'showColliderMesh')
+    .name('Collider mesh (GLB)')
+    .onChange((v) => {
+      if (levelColliderRoot) levelColliderRoot.visible = v;
+    });
+  sceneVis
+    .add(layerParams, 'showSplat')
+    .name('SPZ splat')
+    .onChange((v) => {
+      if (ruinsSplat) ruinsSplat.visible = v;
+    });
+  sceneVis.open();
+
+  const sparkLod = gameGUI.addFolder('Spark 2.0 LoD');
+  sparkLod
+    .add(sparkLodParams, 'lodSplatScale', 0.25, 4, 0.05)
+    .name('lodSplatScale (detail)')
+    .onChange((v) => {
+      if (sparkRenderer) sparkRenderer.lodSplatScale = v;
+    });
+  sparkLod.add({
+    help: () => {
+      console.info(
+        '[TombVaider] Pre-build LoD .RAD:\n  npm run build:rad -- public/ruins.spz --quality\n' +
+          '→ public/ruins-lod.rad\n' +
+          'Chunked HTTP streaming: build with --rad-chunked, set splatLoadParams.pagedStreaming = true in main.js.\n' +
+          'Docs: https://sparkjs.dev/2.0.0-preview/docs/lod-getting-started/'
+      );
+    },
+  }, 'help').name('Log .RAD / LoD help');
+  sparkLod.open();
+
+  const cam = gameGUI.addFolder('Camera');
+  cam
+    .add(cameraParams, 'followDistance', 2, 400, 0.5)
+    .name('Zoom (also mouse wheel)')
+    .listen();
+  cam.add(cameraParams, 'followHeight', 0.5, 80, 0.25).name('Height above anchor');
+  cam
+    .add(cameraParams, 'freeOrbit')
+    .name('Free orbit (drag, wheel)')
+    .onChange((v) => {
+      if (!orbitControls) return;
+      orbitControls.enabled = v;
+      document.exitPointerLock?.();
+      if (v) {
+        orbitControls.target.copy(characterRoot.position).add(new THREE.Vector3(0, 1.2, 0));
+        camera.position.set(
+          characterRoot.position.x + 12,
+          characterRoot.position.y + 8,
+          characterRoot.position.z + 12
+        );
+        orbitControls.update();
+      }
+    });
+  cam.open();
 
   const move = gameGUI.addFolder('Movement');
   move.add(physicsParams, 'moveSpeed', 2, 28, 0.5);
   move.add(physicsParams, 'runMultiplier', 1, 3.5, 0.05);
   move.add(physicsParams, 'jumpVelocity', 4, 22, 0.5);
+  move.add(physicsParams, 'flyVerticalSpeed', 2, 40, 0.5).name('Q/E fly speed (Y)');
   move.add(physicsParams, 'gravity', -50, -5, 1);
   move.open();
 
@@ -371,7 +556,7 @@ function alignRuinsToCollider(ruins, colliderRoot) {
   scene.fog.near = fogNear;
   scene.fog.far = fogFar;
 
-  console.log('[TombVaider] Aligned ruins.spz to collider. Level size ~', sz.x.toFixed(1), sz.y.toFixed(1), sz.z.toFixed(1));
+  console.log('[TombVaider] Aligned splats to collider. Level size ~', sz.x.toFixed(1), sz.y.toFixed(1), sz.z.toFixed(1));
 }
 
 function applyLineupPreviewTransforms() {
@@ -410,6 +595,43 @@ function onSplatFineTuneChanged() {
   }
 }
 
+async function isSplatRadAvailable(url) {
+  try {
+    const res = await fetch(url, { method: 'HEAD' });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Spark 2.0: load pre-built LoD `.rad` when present, else `.spz` with `lod: true`.
+ * @see https://sparkjs.dev/2.0.0-preview/docs/lod-getting-started/
+ */
+async function createRuinsSplatMesh() {
+  if (sparkRenderer) {
+    sparkRenderer.pagedExtSplats = !!(splatLoadParams.extSplats && splatLoadParams.pagedStreaming);
+  }
+  const ext = splatLoadParams.extSplats;
+  if (splatLoadParams.preferRad && (await isSplatRadAvailable(ASSETS.splatRad))) {
+    const opts = { url: ASSETS.splatRad };
+    if (ext) opts.extSplats = true;
+    if (splatLoadParams.pagedStreaming) opts.paged = true;
+    return new SplatMesh(opts);
+  }
+  console.info(
+    '[TombVaider] No',
+    ASSETS.splatRad,
+    '— using',
+    ASSETS.splatSpz,
+    'with lod:true. Pre-build:',
+    'npm run build:rad -- public/ruins.spz --quality'
+  );
+  const fallback = { url: ASSETS.splatSpz, lod: true };
+  if (ext) fallback.extSplats = true;
+  return new SplatMesh(fallback);
+}
+
 function snapCharacterToGround() {
   if (!collidersReady) return;
   const x = characterRoot.position.x;
@@ -427,6 +649,17 @@ function loadWorldAndCharacter() {
   const gltfLoader = new GLTFLoader();
   colliderMeshes = [];
   collidersReady = false;
+
+  const loadingSafetyMs = 90000;
+  const clearLoadingSafety = (() => {
+    const id = setTimeout(() => {
+      console.warn(
+        '[TombVaider] Loading screen cleared (timeout). Check Network for failed or huge assets (.spz can be very large; prefer ruins-lod.rad).'
+      );
+      setLoadingVisible(false);
+    }, loadingSafetyMs);
+    return () => clearTimeout(id);
+  })();
 
   gltfLoader.load(
     ASSETS.collider,
@@ -450,27 +683,50 @@ function loadWorldAndCharacter() {
 
       worldRoot.add(colliderRoot);
       alignWorldToCollider(colliderRoot);
+      colliderRoot.visible = layerParams.showColliderMesh;
       collidersReady = colliderMeshes.length > 0;
 
-      const ruins = new SplatMesh({ url: ASSETS.splat });
-      ruinsSplat = ruins;
-      ruins.quaternion.copy(sparkFlipQuat);
-      worldRoot.add(ruins);
-      ruins.initialized.then(() => {
-        alignRuinsToCollider(ruins, colliderRoot);
-        snapCharacterToGround();
+      void (async () => {
+        setLoadingVisible(true, 'Loading splats (Spark 2.0 LoD)…');
+        let ruins;
+        try {
+          ruins = await createRuinsSplatMesh();
+        } catch (e) {
+          console.error('[TombVaider] createRuinsSplatMesh failed:', e);
+          clearLoadingSafety();
+          setLoadingVisible(false);
+          return;
+        }
+        ruinsSplat = ruins;
+        ruins.visible = layerParams.showSplat;
+        ruins.quaternion.copy(sparkFlipQuat);
+        worldRoot.add(ruins);
+
+        clearLoadingSafety();
         setLoadingVisible(false);
-      }).catch((err) => {
-        console.error('Ruins splat failed:', err);
-        setLoadingVisible(true, 'Could not load ruins.spz — add ruins (1).spz in project root');
-        setTimeout(() => setLoadingVisible(false), 5000);
-      });
+
+        ruins.initialized
+          .then(() => {
+            try {
+              alignRuinsToCollider(ruins, colliderRoot);
+              snapCharacterToGround();
+            } catch (e) {
+              console.error('[TombVaider] alignRuinsToCollider failed:', e);
+            }
+          })
+          .catch((err) => {
+            console.error('Ruins splat failed:', err);
+            setLoadingVisible(true, 'Could not load splats — add public/ruins-lod.rad or public/ruins.spz');
+            setTimeout(() => setLoadingVisible(false), 8000);
+          });
+      })();
 
       if (viewParams.showCharacter) loadCharacterModel(gltfLoader);
     },
     undefined,
     (err) => {
       console.error('Collider GLB failed:', err);
+      clearLoadingSafety();
       if (viewParams.showCharacter) loadCharacterModel(gltfLoader);
       setLoadingVisible(false);
     }
@@ -577,8 +833,10 @@ function playAction(name, fade = 0.3) {
 }
 
 function getMoveInput() {
-  const forward = keys['KeyW'] ? 1 : keys['KeyS'] ? -1 : 0;
-  const strafe = keys['KeyD'] ? 1 : keys['KeyA'] ? -1 : 0;
+  const forward =
+    keys['KeyW'] || keys['ArrowUp'] ? 1 : keys['KeyS'] || keys['ArrowDown'] ? -1 : 0;
+  const strafe =
+    keys['KeyD'] || keys['ArrowRight'] ? 1 : keys['KeyA'] || keys['ArrowLeft'] ? -1 : 0;
   return { forward, strafe };
 }
 
@@ -628,12 +886,19 @@ function updateCharacter(delta) {
   velocity.x = smoothMove.x;
   velocity.z = smoothMove.z;
 
-  if (keys['Space'] && isGrounded) {
-    velocity.y = physicsParams.jumpVelocity;
+  const verticalFly = keys['KeyQ'] ? 1 : keys['KeyE'] ? -1 : 0;
+  if (verticalFly !== 0) {
+    characterRoot.position.y += verticalFly * physicsParams.flyVerticalSpeed * delta;
+    velocity.y = 0;
     isGrounded = false;
-    playAction('jump', 0.1);
+  } else {
+    if (keys['Space'] && isGrounded) {
+      velocity.y = physicsParams.jumpVelocity;
+      isGrounded = false;
+      playAction('jump', 0.1);
+    }
+    velocity.y += physicsParams.gravity * delta;
   }
-  velocity.y += physicsParams.gravity * delta;
 
   let stepX = velocity.x * delta;
   let stepZ = velocity.z * delta;
@@ -694,8 +959,14 @@ function updateCharacter(delta) {
     if (moving) {
       const angle = document.pointerLockElement ? cameraYaw : Math.atan2(direction.x, direction.z);
       character.rotation.y = angle;
-      if (document.pointerLockElement) cameraYaw = angle;
+      if (document.pointerLockElement) {
+        cameraYaw = angle;
+      } else if (!lookDragActive) {
+        cameraYaw = angle;
+      }
     } else if (document.pointerLockElement) {
+      character.rotation.y = cameraYaw;
+    } else if (lookDragActive) {
       character.rotation.y = cameraYaw;
     } else {
       cameraYaw = character.rotation.y;
@@ -712,10 +983,15 @@ function updateCharacter(delta) {
     if (!match) playAction(wantAction, 0.2);
   }
 
+  if (orbitControls && cameraParams.freeOrbit) {
+    orbitControls.update();
+    return;
+  }
+
   const targetPos = characterRoot.position.clone();
   targetPos.y += 3;
-  const yaw = document.pointerLockElement ? cameraYaw : (character ? character.rotation.y : 0);
-  const camOffset = new THREE.Vector3(0, 2, 8);
+  const yaw = cameraYaw;
+  const camOffset = new THREE.Vector3(0, cameraParams.followHeight, cameraParams.followDistance);
   camOffset.applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
   const camTarget = targetPos.clone().add(camOffset);
 
