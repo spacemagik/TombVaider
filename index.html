@@ -36,14 +36,20 @@
     }
     #hud kbd { background: #333; padding: 2px 6px; border-radius: 4px; margin: 0 2px; }
     #hud .sub { display: block; margin-top: 6px; font-size: 11px; color: #888; }
+    #splat-diag {
+      position: fixed; top: 12px; left: 12px; z-index: 1; max-width: min(420px, 92vw);
+      background: rgba(0,0,0,0.5); color: #a8a8b8; padding: 8px 12px; border-radius: 6px;
+      font-size: 11px; line-height: 1.35; pointer-events: none;
+    }
   </style>
 </head>
 <body>
   <div id="loading" aria-live="polite">Loading scene…</div>
+  <div id="splat-diag" aria-live="polite"></div>
   <div id="hud">
     <kbd>WASD</kbd> / arrows move · <kbd>Shift</kbd> run · <kbd>Space</kbd> jump · <kbd>Q</kbd>/<kbd>E</kbd> up/down
     · drag canvas look · <kbd>L</kbd> pointer lock · scroll zoom
-    <span class="sub"><kbd>G</kbd> control panel · Spark 2.0 LoD (prefer <code>ruins-lod.rad</code>)</span>
+    <span class="sub"><kbd>G</kbd> control panel · Spark 2.0 LoD (prefer <code>ruins-lod.rad</code>) · if blank here, open same URL in Chrome/Safari (Cursor Simple Browser often blocks Spark)</span>
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>

@@ -78,6 +78,10 @@ const layerParams = {
   showSplat: true,
 };
 
+/** Third-person: below ~6 the camera often sits inside huge splats → solid black / no parallax. */
+const MIN_FOLLOW_DISTANCE = 8;
+const MAX_FOLLOW_DISTANCE = 600;
+
 const cameraParams = {
   followDistance: 8,
   followHeight: 2,
@@ -101,6 +105,8 @@ let baseScale = 1;
 let debugCube = null;
 
 const loadingEl = typeof document !== 'undefined' ? document.getElementById('loading') : null;
+const splatDiagEl = typeof document !== 'undefined' ? document.getElementById('splat-diag') : null;
+let diagFrame = 0;
 function setLoadingVisible(visible, text) {
   if (!loadingEl) return;
   if (text) loadingEl.textContent = text;
@@ -143,9 +149,10 @@ const sparkLodParams = {
 function init() {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x1a1a28);
-  scene.fog = new THREE.Fog(0x1a1a28, 100, 420);
+  /** Wide defaults until align Ruins; tight fog was hiding huge splat + collider scenes. */
+  scene.fog = new THREE.Fog(0x1a1a28, 80, 250000);
 
-  camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 2000);
+  camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.05, 250000);
   camera.position.set(0, 4, 10);
 
   renderer = new THREE.WebGLRenderer({ antialias: false });
@@ -182,8 +189,8 @@ function init() {
       const step = dy * scale;
       cameraParams.followDistance = THREE.MathUtils.clamp(
         cameraParams.followDistance + step,
-        1,
-        600
+        MIN_FOLLOW_DISTANCE,
+        MAX_FOLLOW_DISTANCE
       );
     },
     { passive: false }
@@ -307,6 +314,7 @@ function setColliderWireframe(show) {
         transparent: true,
         opacity: 0.45,
         depthTest: true,
+        depthWrite: false,
         side: THREE.DoubleSide,
       });
     } else {
@@ -336,7 +344,7 @@ function setupGameGUI() {
   const sceneVis = gameGUI.addFolder('Scene layers');
   sceneVis
     .add(layerParams, 'showColliderMesh')
-    .name('Collider mesh (GLB)')
+    .name('Collider mesh (faint green + wireframe opt.)')
     .onChange((v) => {
       if (levelColliderRoot) levelColliderRoot.visible = v;
     });
@@ -369,7 +377,7 @@ function setupGameGUI() {
 
   const cam = gameGUI.addFolder('Camera');
   cam
-    .add(cameraParams, 'followDistance', 2, 400, 0.5)
+    .add(cameraParams, 'followDistance', MIN_FOLLOW_DISTANCE, 400, 0.5)
     .name('Zoom (also mouse wheel)')
     .listen();
   cam.add(cameraParams, 'followHeight', 0.5, 80, 0.25).name('Height above anchor');
@@ -483,14 +491,17 @@ function applyScale() {
   );
 }
 
-/** Invisible mesh: raycasts from both sides (many bake / simplified meshes are flipped). */
+/**
+ * Collider shell: faint + no depth write so it does not hide Spark splats behind it.
+ * (Fully invisible mats looked like “no collider” when the Scene layer was on.)
+ */
 function makeColliderMaterial() {
   return new THREE.MeshBasicMaterial({
+    color: 0x33cc66,
     transparent: true,
-    opacity: 0,
+    opacity: 0.14,
     depthWrite: false,
-    colorWrite: false,
-    visible: false,
+    depthTest: false,
     side: THREE.DoubleSide,
   });
 }
@@ -551,10 +562,14 @@ function alignRuinsToCollider(ruins, colliderRoot) {
   applySplatFineTuneToObject(ruins, delta);
 
   const sz = collWorld.getSize(new THREE.Vector3());
-  const fogFar = Math.max(480, sz.length() * 1.8);
-  const fogNear = Math.min(120, fogFar * 0.12);
-  scene.fog.near = fogNear;
-  scene.fog.far = fogFar;
+  const fogFar = Math.max(2500, sz.length() * 2.4);
+  const fogNear = Math.min(250, fogFar * 0.06);
+  if (!scene.fog) {
+    scene.fog = new THREE.Fog(0x1a1a28, fogNear, fogFar);
+  } else {
+    scene.fog.near = fogNear;
+    scene.fog.far = fogFar;
+  }
 
   console.log('[TombVaider] Aligned splats to collider. Level size ~', sz.x.toFixed(1), sz.y.toFixed(1), sz.z.toFixed(1));
 }
@@ -597,8 +612,13 @@ function onSplatFineTuneChanged() {
 
 async function isSplatRadAvailable(url) {
   try {
-    const res = await fetch(url, { method: 'HEAD' });
-    return res.ok;
+    let res = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+    if (res.ok) return true;
+    if (res.status === 405) {
+      res = await fetch(url, { headers: { Range: 'bytes=0-0' }, cache: 'no-store' });
+      return res.ok || res.status === 206;
+    }
+    return false;
   } catch {
     return false;
   }
@@ -614,6 +634,7 @@ async function createRuinsSplatMesh() {
   }
   const ext = splatLoadParams.extSplats;
   if (splatLoadParams.preferRad && (await isSplatRadAvailable(ASSETS.splatRad))) {
+    console.info('[TombVaider] Loading pre-built LoD:', ASSETS.splatRad);
     const opts = { url: ASSETS.splatRad };
     if (ext) opts.extSplats = true;
     if (splatLoadParams.pagedStreaming) opts.paged = true;
@@ -650,7 +671,8 @@ function loadWorldAndCharacter() {
   colliderMeshes = [];
   collidersReady = false;
 
-  const loadingSafetyMs = 90000;
+  /** Large `.rad` / `.spz` can take many minutes on first load. */
+  const loadingSafetyMs = 900000;
   const clearLoadingSafety = (() => {
     const id = setTimeout(() => {
       console.warn(
@@ -687,7 +709,7 @@ function loadWorldAndCharacter() {
       collidersReady = colliderMeshes.length > 0;
 
       void (async () => {
-        setLoadingVisible(true, 'Loading splats (Spark 2.0 LoD)…');
+        setLoadingVisible(true, 'Loading splats (Spark 2.0 LoD) — large .rad can take several minutes…');
         let ruins;
         try {
           ruins = await createRuinsSplatMesh();
@@ -699,26 +721,26 @@ function loadWorldAndCharacter() {
         }
         ruinsSplat = ruins;
         ruins.visible = layerParams.showSplat;
+        ruins.frustumCulled = false;
         ruins.quaternion.copy(sparkFlipQuat);
         worldRoot.add(ruins);
 
-        clearLoadingSafety();
-        setLoadingVisible(false);
-
-        ruins.initialized
-          .then(() => {
-            try {
-              alignRuinsToCollider(ruins, colliderRoot);
-              snapCharacterToGround();
-            } catch (e) {
-              console.error('[TombVaider] alignRuinsToCollider failed:', e);
-            }
-          })
-          .catch((err) => {
-            console.error('Ruins splat failed:', err);
-            setLoadingVisible(true, 'Could not load splats — add public/ruins-lod.rad or public/ruins.spz');
-            setTimeout(() => setLoadingVisible(false), 8000);
-          });
+        try {
+          await ruins.initialized;
+          try {
+            alignRuinsToCollider(ruins, colliderRoot);
+            snapCharacterToGround();
+          } catch (e) {
+            console.error('[TombVaider] alignRuinsToCollider failed:', e);
+          }
+          clearLoadingSafety();
+          setLoadingVisible(false);
+        } catch (err) {
+          console.error('Ruins splat failed:', err);
+          clearLoadingSafety();
+          setLoadingVisible(true, 'Could not load splats — check Network tab / public/ruins-lod.rad');
+          setTimeout(() => setLoadingVisible(false), 12000);
+        }
       })();
 
       if (viewParams.showCharacter) loadCharacterModel(gltfLoader);
@@ -991,7 +1013,13 @@ function updateCharacter(delta) {
   const targetPos = characterRoot.position.clone();
   targetPos.y += 3;
   const yaw = cameraYaw;
-  const camOffset = new THREE.Vector3(0, cameraParams.followHeight, cameraParams.followDistance);
+  const fd = THREE.MathUtils.clamp(
+    cameraParams.followDistance,
+    MIN_FOLLOW_DISTANCE,
+    MAX_FOLLOW_DISTANCE
+  );
+  if (fd !== cameraParams.followDistance) cameraParams.followDistance = fd;
+  const camOffset = new THREE.Vector3(0, cameraParams.followHeight, fd);
   camOffset.applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
   const camTarget = targetPos.clone().add(camOffset);
 
@@ -1007,6 +1035,24 @@ function animate() {
   if (mixer) mixer.update(delta);
   updateCharacter(delta);
   renderer.render(scene, camera);
+
+  diagFrame = (diagFrame + 1) % 45;
+  if (splatDiagEl && diagFrame === 0) {
+    if (!ruinsSplat) {
+      splatDiagEl.textContent = 'Splats: (not created yet)';
+    } else if (!ruinsSplat.isInitialized) {
+      splatDiagEl.textContent = 'Splats: decoding / LoD prep… (large .rad can take minutes)';
+    } else {
+      let n = 0;
+      try {
+        n = ruinsSplat.getNumSplats();
+      } catch (_) {
+        n = -1;
+      }
+      splatDiagEl.textContent =
+        `Spark: ${n >= 0 ? n.toLocaleString() + ' splats (source)' : 'ready'} · camera far ${camera.far.toFixed(0)}`;
+    }
+  }
 }
 
 function onResize() {
