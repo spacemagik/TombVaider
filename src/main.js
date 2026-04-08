@@ -198,6 +198,12 @@ const splatLoadParams = {
   // Default to SPZ so you can confirm the raw capture renders.
   // (RAD is faster/better once you trust the pipeline.)
   preferRad: false,
+  /**
+   * When true, `.spz` loads with Spark worker LoD (`lod: true`): smaller GPU footprint but the renderer
+   * only draws the LoD subset (`lodIndices`). If traversal returns 0 splats you still see collider/wireframe.
+   * Default false = full packed splats (like pre–Spark-2 preview) until you use a pre-built `.rad`.
+   */
+  runtimeLodForSpz: false,
   /** Use with `build:rad -- … --rad-chunked`; requires matching .radc chunk files. */
   pagedStreaming: false,
   /** For large coordinates: set on mesh + SparkRenderer.pagedExtSplats when using paged. */
@@ -498,6 +504,10 @@ function setupGameGUI() {
       void reloadRuinsSplats();
     });
   sparkLod
+    .add(splatLoadParams, 'runtimeLodForSpz')
+    .name('Runtime LoD on .spz (subset draw)')
+    .onChange(() => void reloadRuinsSplats());
+  sparkLod
     .add(sparkLodParams, 'lodSplatScale', 0.25, 4, 0.05)
     .name('lodSplatScale (detail)')
     .onChange((v) => {
@@ -510,6 +520,7 @@ function setupGameGUI() {
         '[TombVaider] Pre-build LoD .RAD:\n  npm run build:rad -- public/ruins.spz --quality\n' +
           '→ public/ruins-lod.rad\n' +
           'Chunked HTTP streaming: build with --rad-chunked, set splatLoadParams.pagedStreaming = true in main.js.\n' +
+          'If .spz looks empty with “Runtime LoD on .spz” enabled, turn it off (full packed draw) or use .rad.\n' +
           'Docs: https://sparkjs.dev/2.0.0-preview/docs/lod-getting-started/'
       );
     },
@@ -886,7 +897,7 @@ async function isSplatRadAvailable(url) {
 }
 
 /**
- * Spark 2.0: load pre-built LoD `.rad` when present, else `.spz` with `lod: true`.
+ * Spark 2.0: load pre-built LoD `.rad` when present, else `.spz` (optional runtime LoD).
  * @see https://sparkjs.dev/2.0.0-preview/docs/lod-getting-started/
  */
 async function createRuinsSplatMesh() {
@@ -902,18 +913,39 @@ async function createRuinsSplatMesh() {
     if (splatLoadParams.pagedStreaming) opts.paged = true;
     return new SplatMesh(opts);
   }
-  splatSourceLabel = `${ASSETS.splatSpz} (lod:true)`;
+  const useLod = splatLoadParams.runtimeLodForSpz;
+  splatSourceLabel = `${ASSETS.splatSpz} (lod:${useLod})`;
   console.info(
     '[TombVaider] No',
     ASSETS.splatRad,
     '— using',
     ASSETS.splatSpz,
-    'with lod:true. Pre-build:',
+    useLod ? 'with runtime LoD.' : 'full splat set (runtime LoD off). Pre-build:',
     'npm run build:rad -- public/ruins.spz --quality'
   );
-  const fallback = { url: ASSETS.splatSpz, lod: true };
+  const fallback = { url: ASSETS.splatSpz, lod: useLod };
   if (ext) fallback.extSplats = true;
   return new SplatMesh(fallback);
+}
+
+function logSparkSplatDiagnostics(ruins) {
+  try {
+    const pk = ruins?.packedSplats;
+    const lodPk = pk?.lodSplats;
+    console.info('[TombVaider] Spark diagnostics (after splat init)', {
+      source: splatSourceLabel,
+      meshVisible: ruins?.visible,
+      packedNumSplats: pk?.getNumSplats?.() ?? null,
+      hasLodSplats: !!lodPk,
+      lodPackedNumSplats: lodPk?.getNumSplats?.() ?? null,
+      meshNumSplats: ruins?.numSplats ?? null,
+      sparkActiveSplats: sparkRenderer?.activeSplats ?? null,
+      sparkInstanceCount: sparkRenderer?.geometry?.instanceCount ?? null,
+      sparkEnableLod: sparkRenderer?.enableLod ?? null,
+    });
+  } catch (e) {
+    console.warn('[TombVaider] Spark diagnostics failed:', e);
+  }
 }
 
 async function reloadRuinsSplats() {
@@ -953,6 +985,8 @@ async function reloadRuinsSplats() {
     snapCharacterToGround();
     focusOnRuins();
     updateSplatBoundsHelper();
+    logSparkSplatDiagnostics(ruins);
+    setTimeout(() => logSparkSplatDiagnostics(ruins), 750);
   } catch (e) {
     console.error('[TombVaider] reloadRuinsSplats init failed:', e);
   } finally {
@@ -1051,6 +1085,8 @@ function loadWorldAndCharacter() {
               autoShowBothLayersOnce = false;
               showColliderAndSplat();
             }
+            logSparkSplatDiagnostics(ruins);
+            setTimeout(() => logSparkSplatDiagnostics(ruins), 750);
           } catch (e) {
             console.error('[TombVaider] alignRuinsToCollider failed:', e);
           }
