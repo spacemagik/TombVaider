@@ -1,9 +1,27 @@
-import * as THREE from 'three';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { SplatMesh, SparkRenderer } from '@sparkjsdev/spark';
 import GUI from 'lil-gui';
+
+// IMPORTANT:
+// - Spark preview injects custom shader chunks (e.g. THREE.ShaderChunk.splatDefines).
+// - If Spark and your renderer use different `three` module instances, you'll get:
+//   "Can not resolve #include <splatDefines>"
+// - We also need `THREE` available before module-level constants are created.
+//
+// So we load BOTH Three + Spark from the same CDN up-front using top-level await.
+const THREE = await import(
+  /* @vite-ignore */ 'https://unpkg.com/three@0.180.0/build/three.module.js'
+);
+const { OrbitControls } = await import(
+  /* @vite-ignore */ 'https://unpkg.com/three@0.180.0/examples/jsm/controls/OrbitControls.js'
+);
+const { GLTFLoader } = await import(
+  /* @vite-ignore */ 'https://unpkg.com/three@0.180.0/examples/jsm/loaders/GLTFLoader.js'
+);
+const { FBXLoader } = await import(
+  /* @vite-ignore */ 'https://unpkg.com/three@0.180.0/examples/jsm/loaders/FBXLoader.js'
+);
+const { SplatMesh, SparkRenderer, SplatGenerator } = await import(
+  /* @vite-ignore */ 'https://sparkjs.dev/releases/spark/preview/2.0.0/spark.module.js'
+);
 
 // --- Game State ---
 const keys = {};
@@ -55,6 +73,8 @@ let collidersReady = false;
 let ruinsSplat = null;
 /** @type {THREE.Object3D | null} */
 let levelColliderRoot = null;
+/** @type {THREE.Box3Helper | null} */
+let splatBoundsHelper = null;
 
 /** Extra splat transform after auto-align (also used in origin preview). */
 const splatFineTune = {
@@ -74,8 +94,18 @@ const viewParams = {
 };
 
 const layerParams = {
+  // Collider is for physics. Use the wireframe toggle to *see* it.
   showColliderMesh: true,
   showSplat: true,
+};
+
+const debugParams = {
+  /** Off by default so dense wireframe does not cover transparent splats. */
+  showColliderWireframe: false,
+  showDebugCube: false,
+  showSplatBounds: false,
+  /** Draw splats on top (helps when collider / depth interaction hides them). */
+  splatsOnTop: true,
 };
 
 /** Third-person: below ~6 the camera often sits inside huge splats → solid black / no parallax. */
@@ -101,12 +131,43 @@ const scaleParams = {
   uniformScale: 1,
 };
 let gameGUI = null;
+/** lil-gui controllers to refresh after programmatic layer changes */
+let guiRefs = {
+  showColliderMesh: null,
+  showSplat: null,
+  showColliderWireframe: null,
+};
+/** First successful splat load: force collider + SPZ visible (Spark skips invisible splats). */
+let autoShowBothLayersOnce = true;
 let baseScale = 1;
 let debugCube = null;
+
+/**
+ * Spark only collects SplatMeshes that pass `traverseVisible` — if `ruinsSplat.visible`
+ * is false, you get zero splats on screen even when data loaded (HUD can still say READY).
+ */
+function applySceneLayerVisibility() {
+  if (levelColliderRoot) levelColliderRoot.visible = layerParams.showColliderMesh;
+  if (ruinsSplat) ruinsSplat.visible = layerParams.showSplat;
+}
+
+/** Turn on collider + SPZ together (fixes “onlyCollider” leaving splats stuck invisible). */
+function showColliderAndSplat() {
+  layerParams.showColliderMesh = true;
+  layerParams.showSplat = true;
+  debugParams.showColliderWireframe = true;
+  applySceneLayerVisibility();
+  setColliderWireframe(true);
+  guiRefs.showColliderMesh?.updateDisplay?.();
+  guiRefs.showSplat?.updateDisplay?.();
+  guiRefs.showColliderWireframe?.updateDisplay?.();
+  updateSplatBoundsHelper();
+}
 
 const loadingEl = typeof document !== 'undefined' ? document.getElementById('loading') : null;
 const splatDiagEl = typeof document !== 'undefined' ? document.getElementById('splat-diag') : null;
 let diagFrame = 0;
+let splatSourceLabel = '';
 function setLoadingVisible(visible, text) {
   if (!loadingEl) return;
   if (text) loadingEl.textContent = text;
@@ -134,7 +195,9 @@ const ASSETS = {
 
 /** Spark 2.0: pre-built .RAD vs runtime lod; paged streaming for chunked .rad + .radc (see Spark LoD docs). */
 const splatLoadParams = {
-  preferRad: true,
+  // Default to SPZ so you can confirm the raw capture renders.
+  // (RAD is faster/better once you trust the pipeline.)
+  preferRad: false,
   /** Use with `build:rad -- … --rad-chunked`; requires matching .radc chunk files. */
   pagedStreaming: false,
   /** For large coordinates: set on mesh + SparkRenderer.pagedExtSplats when using paged. */
@@ -142,8 +205,30 @@ const splatLoadParams = {
 };
 
 const sparkLodParams = {
-  lodSplatScale: 1,
+  /** Higher = more splat detail at distance (helps huge scenes). */
+  lodSplatScale: 2,
 };
+
+/** After XY + floor alignment, scale splat so its world AABB “size” matches the collider’s (max axis). */
+const splatAlignParams = {
+  scaleToCollider: true,
+};
+
+const splatVisualParams = {
+  // Loud default to distinguish splats from collider wireframe.
+  recolor: '#ff00ff',
+};
+
+function applySparkDrawOrder() {
+  if (!sparkRenderer?.material) return;
+  if (debugParams.splatsOnTop) {
+    sparkRenderer.renderOrder = 1000;
+    sparkRenderer.material.depthTest = false;
+  } else {
+    sparkRenderer.renderOrder = 0;
+    sparkRenderer.material.depthTest = true;
+  }
+}
 
 // --- Scene Setup ---
 function init() {
@@ -168,7 +253,21 @@ function init() {
     clock,
     lodSplatScale: sparkLodParams.lodSplatScale,
     pagedExtSplats: splatLoadParams.extSplats && splatLoadParams.pagedStreaming,
+    // Easier to see faint / distant Gaussians while tuning alignment.
+    minAlpha: 0,
+    minPixelRadius: 1.2,
+    blurAmount: 0.35,
+    maxStdDev: Math.sqrt(9),
   });
+  // Ensure Spark hooks run even if its internal bounds don't match camera yet.
+  sparkRenderer.frustumCulled = false;
+  applySparkDrawOrder();
+  // Spark preview toggles debugFlag every second in onBeforeRender → rainbow / green debug colors.
+  const _sparkOb = SparkRenderer.prototype.onBeforeRender;
+  sparkRenderer.onBeforeRender = function sparkOnBeforeRenderPatch(r, sc, cam) {
+    _sparkOb.call(this, r, sc, cam);
+    if (this.material?.uniforms?.debugFlag) this.material.uniforms.debugFlag.value = false;
+  };
   scene.add(sparkRenderer);
 
   orbitControls = new OrbitControls(camera, renderer.domElement);
@@ -309,7 +408,8 @@ function setColliderWireframe(show) {
     if (show) {
       if (!m.userData._colliderMat) m.userData._colliderMat = m.material;
       m.material = new THREE.MeshBasicMaterial({
-        color: 0x22ff66,
+        // Orange wireframe — not the same hue as default magenta splat tint.
+        color: 0xffaa33,
         wireframe: true,
         transparent: true,
         opacity: 0.45,
@@ -329,7 +429,6 @@ function setColliderWireframe(show) {
 function setupGameGUI() {
   if (gameGUI) gameGUI.destroy();
   gameGUI = new GUI({ title: 'Tomb Vaider' });
-  const guiState = { showCollider: false, showDebugCube: false };
 
   const view = gameGUI.addFolder('View');
   view.add(viewParams, 'showCharacter').name('Show character (Laura8)').onChange((v) => {
@@ -342,27 +441,69 @@ function setupGameGUI() {
   view.open();
 
   const sceneVis = gameGUI.addFolder('Scene layers');
-  sceneVis
+  guiRefs.showColliderMesh = sceneVis
     .add(layerParams, 'showColliderMesh')
-    .name('Collider mesh (faint green + wireframe opt.)')
+    .name('Collider mesh (invisible; use wireframe below)')
     .onChange((v) => {
       if (levelColliderRoot) levelColliderRoot.visible = v;
     });
-  sceneVis
+  guiRefs.showSplat = sceneVis
     .add(layerParams, 'showSplat')
     .name('SPZ splat')
     .onChange((v) => {
       if (ruinsSplat) ruinsSplat.visible = v;
     });
+  sceneVis
+    .add({ showBoth: () => showColliderAndSplat() }, 'showBoth')
+    .name('✓ Show collider + SPZ (fix blank splats)');
   sceneVis.open();
 
+  const isolate = gameGUI.addFolder('Isolate');
+  isolate.add({ showBoth: () => showColliderAndSplat() }, 'showBoth').name('Show collider + SPZ');
+  isolate.add({ onlySplat: () => {
+    layerParams.showColliderMesh = false;
+    debugParams.showColliderWireframe = false;
+    if (levelColliderRoot) levelColliderRoot.visible = false;
+    setColliderWireframe(false);
+    // Force splat ON (in case it was toggled off earlier).
+    layerParams.showSplat = true;
+    if (ruinsSplat) ruinsSplat.visible = true;
+    guiRefs.showColliderMesh?.updateDisplay?.();
+    guiRefs.showSplat?.updateDisplay?.();
+    guiRefs.showColliderWireframe?.updateDisplay?.();
+    // Make splat bounds visible for instant confirmation.
+    setSplatBoundsVisible(true);
+    focusOnRuins();
+  } }, 'onlySplat').name('Hide collider (show splat only)');
+  isolate.add({ onlyCollider: () => {
+    layerParams.showSplat = false;
+    if (ruinsSplat) ruinsSplat.visible = false;
+    layerParams.showColliderMesh = true;
+    debugParams.showColliderWireframe = true;
+    if (levelColliderRoot) levelColliderRoot.visible = true;
+    setColliderWireframe(true);
+    setSplatBoundsVisible(false);
+    guiRefs.showColliderMesh?.updateDisplay?.();
+    guiRefs.showSplat?.updateDisplay?.();
+    guiRefs.showColliderWireframe?.updateDisplay?.();
+  } }, 'onlyCollider').name('Hide splat (show collider only)');
+  isolate.open();
+
   const sparkLod = gameGUI.addFolder('Spark 2.0 LoD');
+  sparkLod
+    .add(splatLoadParams, 'preferRad')
+    .name('Prefer .RAD (else SPZ)')
+    .onChange(() => {
+      // reload on toggle so you can verify SPZ rendering
+      void reloadRuinsSplats();
+    });
   sparkLod
     .add(sparkLodParams, 'lodSplatScale', 0.25, 4, 0.05)
     .name('lodSplatScale (detail)')
     .onChange((v) => {
       if (sparkRenderer) sparkRenderer.lodSplatScale = v;
     });
+  sparkLod.add({ reload: () => void reloadRuinsSplats() }, 'reload').name('Reload splats now');
   sparkLod.add({
     help: () => {
       console.info(
@@ -374,6 +515,17 @@ function setupGameGUI() {
     },
   }, 'help').name('Log .RAD / LoD help');
   sparkLod.open();
+
+  const splatVis = gameGUI.addFolder('Splat visual');
+  splatVis.addColor(splatVisualParams, 'recolor').name('Tint').onChange((v) => {
+    if (!ruinsSplat) return;
+    try {
+      ruinsSplat.recolor = new THREE.Color(v);
+    } catch (_) {
+      /* ignore */
+    }
+  });
+  splatVis.open();
 
   const cam = gameGUI.addFolder('Camera');
   cam
@@ -414,12 +566,23 @@ function setupGameGUI() {
   ground.add(physicsParams, 'groundRayFarExtra', 80, 600, 10).name('Ray length extra');
   ground.add(physicsParams, 'snapEpsilon', 0.02, 0.4, 0.01).name('Snap distance');
   ground.add(physicsParams, 'usePlaneFallback').name('Flat floor if no mesh hit');
-  ground.add(guiState, 'showCollider').name('Show collider wireframe').onChange(setColliderWireframe);
+  guiRefs.showColliderWireframe = ground
+    .add(debugParams, 'showColliderWireframe')
+    .name('Show collider wireframe')
+    .onChange(setColliderWireframe);
+  ground
+    .add(debugParams, 'splatsOnTop')
+    .name('Draw splats on top (ignore depth)')
+    .onChange(() => applySparkDrawOrder());
+  ground
+    .add(debugParams, 'showSplatBounds')
+    .name('Show splat bounds (pink box)')
+    .onChange(setSplatBoundsVisible);
   ground.add({ snap: () => snapCharacterToGround() }, 'snap').name('Snap feet to ground now');
   ground.open();
 
   const char = gameGUI.addFolder('Character scale');
-  char.add(guiState, 'showDebugCube').name('Orange debug cube').onChange((v) => {
+  char.add(debugParams, 'showDebugCube').name('Orange debug cube').onChange((v) => {
     if (debugCube) debugCube.visible = v;
   });
   char.add(scaleParams, 'uniformScale', 0.001, 100, 0.01).name('Uniform').onChange(applyScale);
@@ -436,14 +599,26 @@ function setupGameGUI() {
   } }, 'reset').name('Reset scale');
 
   const world = gameGUI.addFolder('Splat ↔ collider');
+  world
+    .add(splatAlignParams, 'scaleToCollider')
+    .name('Match splat size to collider (max axis)')
+    .onChange(() => {
+      if (ruinsSplat && levelColliderRoot) {
+        alignRuinsToCollider(ruinsSplat, levelColliderRoot);
+        snapCharacterToGround();
+        updateSplatBoundsHelper();
+      }
+    });
   world.add({
     realign: () => {
       if (ruinsSplat && levelColliderRoot) {
         alignRuinsToCollider(ruinsSplat, levelColliderRoot);
         snapCharacterToGround();
+        updateSplatBoundsHelper();
       }
     },
   }, 'realign').name('Re-align splat to mesh');
+  world.add({ focus: () => focusOnRuins() }, 'focus').name('Focus camera on splat');
 
   const lineup = gameGUI.addFolder('Line-up at origin (debug)');
   lineup.add({ preview: false }, 'preview').name('Preview: mesh+spz at 0,0,0').onChange((v) => setLineupPreview(v));
@@ -491,17 +666,14 @@ function applyScale() {
   );
 }
 
-/**
- * Collider shell: faint + no depth write so it does not hide Spark splats behind it.
- * (Fully invisible mats looked like “no collider” when the Scene layer was on.)
- */
+/** Invisible mesh: collision + raycasts only. Use wireframe toggle to visualize. */
 function makeColliderMaterial() {
   return new THREE.MeshBasicMaterial({
-    color: 0x33cc66,
     transparent: true,
-    opacity: 0.14,
+    opacity: 0,
     depthWrite: false,
-    depthTest: false,
+    colorWrite: false,
+    visible: false,
     side: THREE.DoubleSide,
   });
 }
@@ -561,6 +733,38 @@ function alignRuinsToCollider(ruins, colliderRoot) {
   );
   applySplatFineTuneToObject(ruins, delta);
 
+  // Match overall size: splat world AABB max edge ≈ collider max edge, then re-snap floor + XZ center.
+  if (splatAlignParams.scaleToCollider) {
+    ruins.updateMatrixWorld(true);
+    const collSize = collWorld.getSize(new THREE.Vector3());
+    const sbFit = ruins.getBoundingBox(false);
+    const splFit = sbFit.clone().applyMatrix4(ruins.matrixWorld);
+    const splSize = splFit.getSize(new THREE.Vector3());
+    const maxC = Math.max(collSize.x, collSize.y, collSize.z, 1e-6);
+    const maxS = Math.max(splSize.x, splSize.y, splSize.z, 1e-6);
+    const sFit = maxC / maxS;
+    ruins.scale.multiplyScalar(sFit);
+    splatFineTune.uniformScale *= sFit;
+
+    ruins.updateMatrixWorld(true);
+    const sb2 = ruins.getBoundingBox(false);
+    const splW2 = sb2.clone().applyMatrix4(ruins.matrixWorld);
+    const cCx = (collWorld.min.x + collWorld.max.x) * 0.5;
+    const cCz = (collWorld.min.z + collWorld.max.z) * 0.5;
+    const sCx = (splW2.min.x + splW2.max.x) * 0.5;
+    const sCz = (splW2.min.z + splW2.max.z) * 0.5;
+    ruins.position.x += cCx - sCx;
+    ruins.position.z += cCz - sCz;
+    ruins.position.y += cMinY - splW2.min.y;
+    ruins.updateMatrixWorld(true);
+    console.log(
+      '[TombVaider] Splat scaled to collider (max axis). factor=',
+      sFit.toFixed(4),
+      'uniformScale=',
+      splatFineTune.uniformScale.toFixed(4)
+    );
+  }
+
   const sz = collWorld.getSize(new THREE.Vector3());
   const fogFar = Math.max(2500, sz.length() * 2.4);
   const fogNear = Math.min(250, fogFar * 0.06);
@@ -574,11 +778,67 @@ function alignRuinsToCollider(ruins, colliderRoot) {
   console.log('[TombVaider] Aligned splats to collider. Level size ~', sz.x.toFixed(1), sz.y.toFixed(1), sz.z.toFixed(1));
 }
 
+function focusOnRuins() {
+  if (!ruinsSplat || !ruinsSplat.isInitialized) return;
+  ruinsSplat.updateMatrixWorld(true);
+  const sb = ruinsSplat.getBoundingBox(false);
+  const worldBox = sb.clone().applyMatrix4(ruinsSplat.matrixWorld);
+  if (!Number.isFinite(worldBox.min.x) || worldBox.isEmpty()) return;
+
+  const center = worldBox.getCenter(new THREE.Vector3());
+  const size = worldBox.getSize(new THREE.Vector3());
+  const radius = Math.max(5, size.length() * 0.35);
+
+  // Put the player somewhere that guarantees splats in view.
+  characterRoot.position.set(center.x, worldBox.max.y + 6, center.z);
+  snapCharacterToGround();
+
+  cameraParams.followHeight = Math.max(cameraParams.followHeight, 6);
+  cameraParams.followDistance = THREE.MathUtils.clamp(radius, MIN_FOLLOW_DISTANCE, MAX_FOLLOW_DISTANCE);
+  cameraYaw = 0;
+
+  if (orbitControls) {
+    orbitControls.target.copy(center);
+    orbitControls.update();
+  }
+}
+
+function updateSplatBoundsHelper() {
+  if (!debugParams.showSplatBounds || !ruinsSplat || !ruinsSplat.isInitialized) return;
+  ruinsSplat.updateMatrixWorld(true);
+  const sb = ruinsSplat.getBoundingBox(false);
+  const worldBox = sb.clone().applyMatrix4(ruinsSplat.matrixWorld);
+  if (!Number.isFinite(worldBox.min.x) || worldBox.isEmpty()) return;
+
+  if (!splatBoundsHelper) {
+    splatBoundsHelper = new THREE.Box3Helper(worldBox, 0xff66ff);
+    splatBoundsHelper.renderOrder = 9999;
+    scene.add(splatBoundsHelper);
+  } else {
+    splatBoundsHelper.box.copy(worldBox);
+  }
+}
+
+function setSplatBoundsVisible(on) {
+  debugParams.showSplatBounds = on;
+  if (!on) {
+    if (splatBoundsHelper) {
+      scene.remove(splatBoundsHelper);
+      splatBoundsHelper.geometry?.dispose?.();
+      splatBoundsHelper.material?.dispose?.();
+      splatBoundsHelper = null;
+    }
+    return;
+  }
+  updateSplatBoundsHelper();
+}
+
 function applyLineupPreviewTransforms() {
   if (!ruinsSplat) return;
   worldRoot.position.set(0, 0, 0);
   worldRoot.updateMatrixWorld(true);
   applySplatFineTuneToObject(ruinsSplat, new THREE.Vector3(0, 0, 0));
+  updateSplatBoundsHelper();
 }
 
 function setLineupPreview(on) {
@@ -608,6 +868,7 @@ function onSplatFineTuneChanged() {
     alignRuinsToCollider(ruinsSplat, levelColliderRoot);
     snapCharacterToGround();
   }
+  updateSplatBoundsHelper();
 }
 
 async function isSplatRadAvailable(url) {
@@ -634,12 +895,14 @@ async function createRuinsSplatMesh() {
   }
   const ext = splatLoadParams.extSplats;
   if (splatLoadParams.preferRad && (await isSplatRadAvailable(ASSETS.splatRad))) {
+    splatSourceLabel = ASSETS.splatRad;
     console.info('[TombVaider] Loading pre-built LoD:', ASSETS.splatRad);
     const opts = { url: ASSETS.splatRad };
     if (ext) opts.extSplats = true;
     if (splatLoadParams.pagedStreaming) opts.paged = true;
     return new SplatMesh(opts);
   }
+  splatSourceLabel = `${ASSETS.splatSpz} (lod:true)`;
   console.info(
     '[TombVaider] No',
     ASSETS.splatRad,
@@ -651,6 +914,50 @@ async function createRuinsSplatMesh() {
   const fallback = { url: ASSETS.splatSpz, lod: true };
   if (ext) fallback.extSplats = true;
   return new SplatMesh(fallback);
+}
+
+async function reloadRuinsSplats() {
+  if (!levelColliderRoot) return;
+  if (ruinsSplat) {
+    try {
+      worldRoot.remove(ruinsSplat);
+    } catch (_) {
+      /* ignore */
+    }
+    ruinsSplat = null;
+  }
+
+  setLoadingVisible(true, `Reloading splats from ${splatLoadParams.preferRad ? ASSETS.splatRad : ASSETS.splatSpz}…`);
+  let ruins;
+  try {
+    ruins = await createRuinsSplatMesh();
+  } catch (e) {
+    console.error('[TombVaider] reloadRuinsSplats create failed:', e);
+    setLoadingVisible(false);
+    return;
+  }
+  ruinsSplat = ruins;
+  ruins.frustumCulled = false;
+  applySceneLayerVisibility();
+  ruins.quaternion.copy(sparkFlipQuat);
+  try {
+    ruins.recolor = new THREE.Color(splatVisualParams.recolor);
+  } catch (_) {
+    /* ignore */
+  }
+  worldRoot.add(ruins);
+
+  try {
+    await ruins.initialized;
+    alignRuinsToCollider(ruins, levelColliderRoot);
+    snapCharacterToGround();
+    focusOnRuins();
+    updateSplatBoundsHelper();
+  } catch (e) {
+    console.error('[TombVaider] reloadRuinsSplats init failed:', e);
+  } finally {
+    setLoadingVisible(false);
+  }
 }
 
 function snapCharacterToGround() {
@@ -706,6 +1013,9 @@ function loadWorldAndCharacter() {
       worldRoot.add(colliderRoot);
       alignWorldToCollider(colliderRoot);
       colliderRoot.visible = layerParams.showColliderMesh;
+      setColliderWireframe(debugParams.showColliderWireframe);
+      // Draw before splats (debug visibility only).
+      colliderRoot.renderOrder = -10;
       collidersReady = colliderMeshes.length > 0;
 
       void (async () => {
@@ -720,9 +1030,14 @@ function loadWorldAndCharacter() {
           return;
         }
         ruinsSplat = ruins;
-        ruins.visible = layerParams.showSplat;
         ruins.frustumCulled = false;
+        applySceneLayerVisibility();
         ruins.quaternion.copy(sparkFlipQuat);
+        try {
+          ruins.recolor = new THREE.Color(splatVisualParams.recolor);
+        } catch (_) {
+          /* ignore */
+        }
         worldRoot.add(ruins);
 
         try {
@@ -730,6 +1045,12 @@ function loadWorldAndCharacter() {
           try {
             alignRuinsToCollider(ruins, colliderRoot);
             snapCharacterToGround();
+            focusOnRuins();
+            updateSplatBoundsHelper();
+            if (autoShowBothLayersOnce) {
+              autoShowBothLayersOnce = false;
+              showColliderAndSplat();
+            }
           } catch (e) {
             console.error('[TombVaider] alignRuinsToCollider failed:', e);
           }
@@ -1038,20 +1359,47 @@ function animate() {
 
   diagFrame = (diagFrame + 1) % 45;
   if (splatDiagEl && diagFrame === 0) {
+    const src = splatSourceLabel ? `src ${splatSourceLabel}` : 'src (unknown)';
+    const col = levelColliderRoot
+      ? `collider visible=${levelColliderRoot.visible}`
+      : 'collider (not loaded)';
+
     if (!ruinsSplat) {
-      splatDiagEl.textContent = 'Splats: (not created yet)';
-    } else if (!ruinsSplat.isInitialized) {
-      splatDiagEl.textContent = 'Splats: decoding / LoD prep… (large .rad can take minutes)';
-    } else {
-      let n = 0;
-      try {
-        n = ruinsSplat.getNumSplats();
-      } catch (_) {
-        n = -1;
-      }
-      splatDiagEl.textContent =
-        `Spark: ${n >= 0 ? n.toLocaleString() + ' splats (source)' : 'ready'} · camera far ${camera.far.toFixed(0)}`;
+      splatDiagEl.textContent = `Splats: NOT LOADED · ${src} · ${col}`;
+      return;
     }
+    if (!ruinsSplat.isInitialized) {
+      splatDiagEl.textContent = `Splats: LOADING… · ${src} · visible=${ruinsSplat.visible} · ${col}`;
+      return;
+    }
+    let n = -1;
+    try {
+      n = ruinsSplat.getNumSplats();
+    } catch (_) {
+      n = -1;
+    }
+    let genAll = 0;
+    let genVis = 0;
+    try {
+      scene.traverse((o) => {
+        if (o instanceof SplatGenerator) genAll += 1;
+      });
+      scene.traverseVisible((o) => {
+        if (o instanceof SplatGenerator) genVis += 1;
+      });
+    } catch (_) {
+      genAll = -1;
+      genVis = -1;
+    }
+    const act = sparkRenderer?.activeSplats ?? -1;
+    const inst = sparkRenderer?.geometry?.instanceCount ?? -1;
+    const visHint = ruinsSplat.visible
+      ? ''
+      : ' · OFF: open G → “Show collider + SPZ” (Spark hides invisible splats)';
+    splatDiagEl.textContent =
+      `Splats: READY ${n >= 0 ? '(' + n.toLocaleString() + ' source)' : ''}` +
+      ` · Spark active=${act} inst=${inst} · gens ${genAll}/${genVis}` +
+      ` · ${src} · splat visible=${ruinsSplat.visible}${visHint} · far ${camera.far.toFixed(0)} · ${col}`;
   }
 }
 

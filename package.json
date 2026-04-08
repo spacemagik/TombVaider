@@ -6,6 +6,7 @@
   "scripts": {
     "start": "vite",
     "dev": "vite",
+    "dev:clean": "vite --host 127.0.0.1 --port 5180 --strictPort",
     "build": "vite build",
     "build:pages": "vite build --base=/TombVaider/",
     "preview": "vite preview",
